@@ -80,22 +80,70 @@ pub async fn write_message<W: AsyncWrite + Unpin>(
 ///
 /// Wire format: 4-byte big-endian length prefix followed by JSON payload.
 /// Returns an error if the message exceeds MAX_MESSAGE_SIZE.
+///
+/// This function is not cancellation safe: dropping its future may discard bytes
+/// already consumed from the reader. In a `select!` loop, retain a
+/// [`MinerMessageReader`] and call its `read_message` method instead.
 pub async fn read_message<R: AsyncRead + Unpin>(reader: &mut R) -> std::io::Result<MinerMessage> {
-	let mut len_buf = [0u8; 4];
-	reader.read_exact(&mut len_buf).await?;
-	let len = u32::from_be_bytes(len_buf);
+	MinerMessageReader::new(reader).read_message().await
+}
 
-	if len > MAX_MESSAGE_SIZE {
-		return Err(std::io::Error::new(
-			std::io::ErrorKind::InvalidData,
-			format!("Message size {} exceeds maximum {}", len, MAX_MESSAGE_SIZE),
-		));
+/// A cancellation-safe reader for length-prefixed JSON miner messages.
+///
+/// Keep this value outside a `select!` loop. Partial length prefixes and payloads
+/// belong to the reader, so dropping a pending [`Self::read_message`] future does
+/// not discard bytes. Dropping the reader itself still discards that state.
+pub struct MinerMessageReader<R> {
+	reader: R,
+	length: [u8; 4],
+	length_read: usize,
+	payload: Vec<u8>,
+	payload_read: usize,
+}
+
+impl<R: AsyncRead + Unpin> MinerMessageReader<R> {
+	/// Wrap an async byte stream, beginning at a message boundary.
+	pub fn new(reader: R) -> Self {
+		Self { reader, length: [0; 4], length_read: 0, payload: Vec::new(), payload_read: 0 }
 	}
 
-	let mut buf = vec![0u8; len as usize];
-	reader.read_exact(&mut buf).await?;
-	serde_json::from_slice(&buf)
-		.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+	/// Read the next message, resuming any interrupted prefix or payload.
+	///
+	/// Cancellation is safe while this reader is retained. Oversized messages are
+	/// rejected before allocating or reading their payload; a truncated stream
+	/// returns [`std::io::ErrorKind::UnexpectedEof`].
+	pub async fn read_message(&mut self) -> std::io::Result<MinerMessage> {
+		while self.length_read < self.length.len() {
+			let count = self.reader.read(&mut self.length[self.length_read..]).await?;
+			if count == 0 {
+				return Err(std::io::ErrorKind::UnexpectedEof.into());
+			}
+			self.length_read += count;
+		}
+		let length = u32::from_be_bytes(self.length);
+		if length > MAX_MESSAGE_SIZE {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::InvalidData,
+				format!("Message size {} exceeds maximum {}", length, MAX_MESSAGE_SIZE),
+			));
+		}
+
+		self.payload.resize(length as usize, 0);
+		while self.payload_read < self.payload.len() {
+			let count = self.reader.read(&mut self.payload[self.payload_read..]).await?;
+			if count == 0 {
+				return Err(std::io::ErrorKind::UnexpectedEof.into());
+			}
+			self.payload_read += count;
+		}
+
+		let message = serde_json::from_slice(&self.payload)
+			.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e));
+		self.length_read = 0;
+		self.payload_read = 0;
+		self.payload.clear();
+		message
+	}
 }
 
 /// Request payload sent from Node to Miner.
