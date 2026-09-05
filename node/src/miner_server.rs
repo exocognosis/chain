@@ -41,7 +41,8 @@ use std::{
 
 use jsonrpsee::tokio;
 use quantus_miner_api::{
-	read_message, write_message, MinerMessage, MiningRequest, MiningResult, MAX_AUTH_TOKEN_LEN,
+	read_message, write_message, MinerMessage, MinerMessageReader, MiningRequest, MiningResult,
+	MAX_AUTH_TOKEN_LEN,
 };
 use rand::RngCore;
 use sp_io::hashing::sha2_256;
@@ -787,12 +788,14 @@ async fn forward_result(
 async fn connection_handler(
 	miner_id: u64,
 	mut send: quinn::SendStream,
-	mut recv: quinn::RecvStream,
+	recv: quinn::RecvStream,
 	mut job_rx: mpsc::Receiver<MiningRequest>,
 	result_tx: mpsc::Sender<MiningResult>,
 	initial_job: Option<MiningRequest>,
 ) -> Result<(), String> {
 	let mut consecutive_drops = 0u32;
+	// Preserve partial frames when a job broadcast wins the receive race.
+	let mut reader = MinerMessageReader::new(recv);
 
 	// Send initial job if there is one (Ready/auth already handled by the caller)
 	if let Some(job) = initial_job {
@@ -809,7 +812,7 @@ async fn connection_handler(
 			biased;
 
 			// Receive results from miner
-			msg_result = read_message(&mut recv) => {
+			msg_result = reader.read_message() => {
 				match msg_result {
 					Ok(MinerMessage::JobResult(mut result)) => {
 						log::info!(
